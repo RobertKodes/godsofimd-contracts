@@ -1,0 +1,577 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import {ERC2981} from "@openzeppelin/contracts/token/common/ERC2981.sol";
+import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+import {IERC4906} from "@openzeppelin/contracts/interfaces/IERC4906.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+
+/// @title GODS OF IMD Inhabitants
+/// @notice One ERC-721 "soul" per character designed in the off-chain character creator.
+/// The game server hashes the canonical character JSON into a `soulHash`; the player forges it here for IMD.
+///
+/// Every forge is split by basis points of the price paid:
+///  - `burnBps` is burned (sent to `burnSink`),
+///  - `shrineBps` funds the {OracleShrine}, the game treasury that buys oracle questions and pays weekly rewards,
+///  - the rest (`payeePoolBps()`) goes to the team and founders, split across the public `payees()` list by their bps.
+/// If the forge names a valid referrer (an address that already owns a soul, other than the minter), `referralBps`
+/// of the price goes to the referrer, taken out of the payees' share.
+///
+/// Petitions and commissions pay the IMD network's cost (`oracleCost`) to the shrine and the rest to the payees.
+/// Secondary sales carry an ERC-2981 royalty to `royaltyReceiver`.
+/// Death in the game never burns the NFT: the steward marks it as a memorial instead.
+///
+/// The Marks: every soul gets one Mark from a fixed deck (`markCap`: Mortal, Blessed, Ascended, Divine; it sums to
+/// `maxSupply`). Nobody chooses it: `reveal` draws it from the hash of the block after the forge, which nobody knew
+/// when the forge was sent, so a Mark cannot be re-rolled. The first souls draw with better odds (`earlyBoost`).
+contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // ------------------------------------------------------------------ types
+
+    /// @notice A recipient of the team-and-founders share. `bps` is of the full price paid.
+    struct Payee {
+        address account;
+        uint16 bps;
+    }
+
+    /// @notice Closed: nobody can forge. Allowlist: only `forgeAllowlist`. Public: `forge` and `forgeAllowlist`.
+    enum Phase {
+        Closed,
+        Allowlist,
+        Public
+    }
+
+    /// @notice A soul's Mark. `Unrevealed` until `reveal` draws it.
+    enum Mark {
+        Unrevealed,
+        Mortal,
+        Blessed,
+        Ascended,
+        Divine
+    }
+
+    /// @dev How one forge payment is divided (see `previewSplit`).
+    struct Split {
+        uint256 burned;
+        uint256 toShrine;
+        uint256 toPayees;
+        uint256 toReferrer;
+    }
+
+    // -------------------------------------------------------------- constants
+
+    uint16 public constant BPS = 10_000;
+    uint256 public constant MAX_PAYEES = 10;
+    bytes4 private constant ERC4906_INTERFACE_ID = bytes4(0x49064906);
+
+    // ------------------------------------------------------------------ state
+
+    IERC20 public immutable imd;
+    address public shrine;
+    address public burnSink;
+    /// @notice Game server: memorials and metadata refresh notifications.
+    address public steward;
+    /// @notice ERC-2981 royalty receiver (defaults to the first payee).
+    address public royaltyReceiver;
+
+    uint256 public mintPrice;
+    uint256 public allowlistPrice;
+    uint256 public petitionPrice = 0.75 ether;
+    uint256 public commissionPrice = 1 ether;
+    /// @notice Part of each petition/commission forwarded to the shrine: what one IMD action costs (0.5 IMD).
+    uint256 public oracleCost = 0.5 ether;
+    uint16 public burnBps = 2000;
+    uint16 public shrineBps = 1000;
+    /// @notice Paid to a valid referrer out of the payees' share. Never above `payeePoolBps()`.
+    uint16 public referralBps = 500;
+
+    Phase public phase;
+    /// @notice `GENESIS_SUPPLY`, the sum of `markCap`.
+    uint256 public maxSupply;
+    /// @notice Cap on public-price forges per wallet (`mintedBy`). 0 = unlimited. Allowlist forges don't count.
+    uint256 public maxPerWallet;
+    uint256 public totalForged;
+    /// @notice Root of an OpenZeppelin StandardMerkleTree of `(address account, uint256 maxMints)`.
+    bytes32 public allowlistRoot;
+
+    Payee[] private _payees;
+
+    /// @notice Souls of each Mark in the deck, by `Mark - 1` (Mortal, Blessed, Ascended, Divine). Fixed at deploy.
+    uint16[4] public markCap;
+    /// @notice Souls of each Mark revealed so far, by `Mark - 1`.
+    uint16[4] public markRevealed;
+    mapping(uint256 => Mark) public markOf;
+    /// @notice The block whose hash draws the soul's Mark; 0 once revealed.
+    mapping(uint256 => uint256) public revealBlock;
+
+    mapping(uint256 => bytes32) public soulHashOf;
+    mapping(bytes32 => uint256) public tokenOfSoul;
+    mapping(uint256 => bool) public memorial;
+    /// @notice Hash of the chronicle recorded when the soul fell (0 while alive).
+    mapping(uint256 => bytes32) public chronicleOf;
+    /// @notice Public-price forges per wallet.
+    mapping(address => uint256) public mintedBy;
+    /// @notice Allowlist forges per wallet (capped by the `maxMints` in the allowlist leaf).
+    mapping(address => uint256) public allowlistMinted;
+    /// @notice Souls forged with this address as a valid referrer.
+    mapping(address => uint256) public referralCount;
+    /// @notice IMD paid to this address as referrer.
+    mapping(address => uint256) public referralEarned;
+
+    string private _baseTokenURI;
+
+    // ----------------------------------------------------------------- events
+
+    event SoulForged(
+        uint256 indexed tokenId,
+        address indexed owner,
+        bytes32 indexed soulHash,
+        uint256 price,
+        uint256 burned,
+        uint256 toShrine,
+        uint256 toPayees,
+        address referrer,
+        uint256 toReferrer
+    );
+    event Referred(address indexed referrer, uint256 indexed tokenId, uint256 amount);
+    event Petitioned(uint256 indexed tokenId, address indexed by, bytes32 indexed petitionHash, uint256 paid);
+    event Commissioned(uint256 indexed tokenId, address indexed by, uint8 kind, bytes32 indexed briefHash, uint256 paid);
+    event Memorialized(uint256 indexed tokenId, bytes32 chronicleHash);
+
+    event PricesUpdated(uint256 mintPrice, uint256 allowlistPrice, uint256 petitionPrice, uint256 commissionPrice);
+    event SplitUpdated(uint16 burnBps, uint16 shrineBps);
+    event PayeesUpdated(Payee[] payees);
+    event ReferralBpsUpdated(uint16 referralBps);
+    event AddressesUpdated(address shrine, address burnSink);
+    event BaseURIUpdated(string baseURI);
+    event StewardUpdated(address indexed previousSteward, address indexed newSteward);
+    event PhaseUpdated(Phase phase);
+    event AllowlistRootUpdated(bytes32 root);
+    event MarkRevealed(uint256 indexed tokenId, Mark mark);
+    event MaxPerWalletUpdated(uint256 maxPerWallet);
+    event OracleCostUpdated(uint256 oracleCost);
+    event RoyaltyUpdated(address receiver, uint96 bps);
+
+    // ----------------------------------------------------------------- errors
+
+    error ZeroAddress();
+    error NotSteward(address caller);
+    error NotTokenOwner(uint256 tokenId, address caller);
+    error ForgeClosed();
+    error AllowlistOnly();
+    error ZeroSoulHash();
+    error SoulAlreadyForged(bytes32 soulHash, uint256 tokenId);
+    error MaxSupplyReached(uint256 maxSupply);
+    error NotRevealable(uint256 tokenId);
+    error WalletLimitReached(address account, uint256 maxPerWallet);
+    error InvalidProof();
+    error AllowlistCapReached(address account, uint256 maxMints);
+    error SoulIsMemorial(uint256 tokenId);
+    error AlreadyMemorial(uint256 tokenId);
+    error InvalidSplit(uint256 burnBps, uint256 shrineBps);
+    error InvalidPayeeCount(uint256 count);
+    error ZeroPayeeBps(uint256 index);
+    error DuplicatePayee(address account);
+    error PayeeBpsMismatch(uint256 sum, uint256 expected);
+    error InvalidReferralBps(uint256 referralBps, uint256 payeePoolBps);
+
+    // ------------------------------------------------------------- modifiers
+
+    modifier onlySteward() {
+        if (msg.sender != steward) revert NotSteward(msg.sender);
+        _;
+    }
+
+    modifier onlyTokenOwner(uint256 tokenId) {
+        if (ownerOf(tokenId) != msg.sender) revert NotTokenOwner(tokenId, msg.sender);
+        _;
+    }
+
+    // ----------------------------------------------------------- constructor
+
+    /// @notice Genesis: 1000 souls, ever. The deck (Mortal, Blessed, Ascended, Divine) is fixed with it.
+    uint256 public constant GENESIS_SUPPLY = 1000;
+
+    /// @dev Only addresses, so IMD's launch can deploy it as is (`$owner`, `$contract:OracleShrine`). The Genesis
+    /// rules are built in: 1000 souls, the deck 640 / 250 / 100 / 10, 5 IMD public and 4 IMD allowlist. Until the
+    /// owner calls `setPayees`, the whole team share and the 5% royalty go to the owner; `setBaseURI` points the
+    /// metadata at the game. Starts in `Phase.Closed`; the owner opens it with `setPhase`.
+    constructor(address owner_, IERC20 imd_, address shrine_, address burnSink_)
+        ERC721("GODS OF IMD Inhabitants", "SOUL")
+        Ownable(owner_)
+    {
+        if (address(imd_) == address(0) || shrine_ == address(0) || burnSink_ == address(0)) revert ZeroAddress();
+        imd = imd_;
+        shrine = shrine_;
+        burnSink = burnSink_;
+        steward = owner_;
+        maxSupply = GENESIS_SUPPLY;
+        markCap = [uint16(640), 250, 100, 10];
+        mintPrice = 5 ether;
+        allowlistPrice = 4 ether;
+        Payee[] memory team = new Payee[](1);
+        team[0] = Payee(owner_, uint16(payeePoolBps()));
+        _setPayees(team);
+        royaltyReceiver = owner_;
+        _setDefaultRoyalty(owner_, 500); // 5% on secondary sales
+    }
+
+    // ---------------------------------------------------------------- player
+
+    /// @notice Forge a soul at `mintPrice` (Public phase only). Pulls the price in IMD from the caller
+    /// (approve this contract first) and mints the next token id to the caller.
+    /// @param referrer optional; paid `referralBps` if it owns a soul and is not the caller, otherwise ignored.
+    function forge(bytes32 soulHash, address referrer) external nonReentrant returns (uint256 tokenId) {
+        Phase p = phase;
+        if (p != Phase.Public) {
+            if (p == Phase.Closed) revert ForgeClosed();
+            revert AllowlistOnly();
+        }
+        uint256 limit = maxPerWallet;
+        uint256 minted = mintedBy[msg.sender];
+        if (limit != 0 && minted >= limit) revert WalletLimitReached(msg.sender, limit);
+        mintedBy[msg.sender] = minted + 1;
+        tokenId = _forge(soulHash, referrer, mintPrice);
+    }
+
+    /// @notice Forge a soul at `allowlistPrice` with an allowlist slot (IMD agent-seat holders, the "Seers").
+    /// Works in the Allowlist and Public phases. The caller must be in the allowlist tree with `maxMints` slots;
+    /// leaf = keccak256(bytes.concat(keccak256(abi.encode(account, maxMints)))).
+    function forgeAllowlist(bytes32 soulHash, address referrer, uint256 maxMints, bytes32[] calldata proof)
+        external
+        nonReentrant
+        returns (uint256 tokenId)
+    {
+        if (phase == Phase.Closed) revert ForgeClosed();
+        if (!MerkleProof.verifyCalldata(proof, allowlistRoot, allowlistLeaf(msg.sender, maxMints))) {
+            revert InvalidProof();
+        }
+        uint256 used = allowlistMinted[msg.sender];
+        if (used >= maxMints) revert AllowlistCapReached(msg.sender, maxMints);
+        allowlistMinted[msg.sender] = used + 1;
+        tokenId = _forge(soulHash, referrer, allowlistPrice);
+    }
+
+    /// @notice Petition the God on behalf of a living soul you own. Pays `petitionPrice` IMD:
+    /// `oracleCost` to the shrine (one oracle question), the rest to the payees.
+    function petition(uint256 tokenId, bytes32 petitionHash) external nonReentrant onlyTokenOwner(tokenId) {
+        if (memorial[tokenId]) revert SoulIsMemorial(tokenId);
+        uint256 paid = petitionPrice;
+        _collectService(paid);
+        emit Petitioned(tokenId, msg.sender, petitionHash, paid);
+    }
+
+    /// @notice Commission work (art, lore, ...) for a soul you own. Pays `commissionPrice` IMD:
+    /// `oracleCost` to the shrine (one IMD job), the rest to the payees.
+    function commission(uint256 tokenId, uint8 kind, bytes32 briefHash) external nonReentrant onlyTokenOwner(tokenId) {
+        uint256 paid = commissionPrice;
+        _collectService(paid);
+        emit Commissioned(tokenId, msg.sender, kind, briefHash, paid);
+    }
+
+    // ------------------------------------------------------------------ marks
+
+    /// @notice Reveal a forged soul's Mark. Anyone may call it from the second block after the forge (the game
+    /// server does it at once). The Mark is drawn from the deck that is left, weighted by `earlyBoost`, using the
+    /// hash of the block after the forge. If that hash is older than 256 blocks, the latest block hash is used.
+    function reveal(uint256 tokenId) public {
+        uint256 b = revealBlock[tokenId];
+        if (b == 0 || block.number <= b) revert NotRevealable(tokenId);
+        bytes32 h = blockhash(b);
+        if (h == bytes32(0)) h = blockhash(block.number - 1);
+        delete revealBlock[tokenId];
+        Mark m = _draw(uint256(keccak256(abi.encode(h, soulHashOf[tokenId], tokenId))), earlyBoost(tokenId));
+        markOf[tokenId] = m;
+        unchecked {
+            ++markRevealed[uint8(m) - 1];
+        }
+        emit MarkRevealed(tokenId, m);
+        emit MetadataUpdate(tokenId);
+    }
+
+    /// @notice `reveal` for every listed soul that can be revealed now; the others are skipped.
+    function revealMany(uint256[] calldata tokenIds) external {
+        for (uint256 i; i < tokenIds.length; ++i) {
+            uint256 b = revealBlock[tokenIds[i]];
+            if (b != 0 && block.number > b) reveal(tokenIds[i]);
+        }
+    }
+
+    /// @notice How much the odds of a rare Mark (Blessed and above) are multiplied, by forge order:
+    /// souls 1-10 x5, 11-50 x3, 51-150 x2, then x1. The deck stays fixed, so early luck only empties it sooner.
+    function earlyBoost(uint256 tokenId) public pure returns (uint256) {
+        if (tokenId <= 10) return 5;
+        if (tokenId <= 50) return 3;
+        if (tokenId <= 150) return 2;
+        return 1;
+    }
+
+    // --------------------------------------------------------------- steward
+
+    /// @notice Mark a fallen soul as a memorial. The NFT is never burned.
+    function setMemorial(uint256 tokenId, bytes32 chronicleHash) external onlySteward {
+        _requireOwned(tokenId);
+        if (memorial[tokenId]) revert AlreadyMemorial(tokenId);
+        memorial[tokenId] = true;
+        chronicleOf[tokenId] = chronicleHash;
+        emit Memorialized(tokenId, chronicleHash);
+        emit MetadataUpdate(tokenId);
+    }
+
+    function refresh(uint256 tokenId) external onlySteward {
+        _requireOwned(tokenId);
+        emit MetadataUpdate(tokenId);
+    }
+
+    function refreshAll() external onlySteward {
+        emit BatchMetadataUpdate(1, type(uint256).max);
+    }
+
+    // ----------------------------------------------------------------- owner
+
+    function setPrices(uint256 mintPrice_, uint256 allowlistPrice_, uint256 petitionPrice_, uint256 commissionPrice_)
+        external
+        onlyOwner
+    {
+        mintPrice = mintPrice_;
+        allowlistPrice = allowlistPrice_;
+        petitionPrice = petitionPrice_;
+        commissionPrice = commissionPrice_;
+        emit PricesUpdated(mintPrice_, allowlistPrice_, petitionPrice_, commissionPrice_);
+    }
+
+    function setOracleCost(uint256 oracleCost_) external onlyOwner {
+        oracleCost = oracleCost_;
+        emit OracleCostUpdated(oracleCost_);
+    }
+
+    /// @param bps royalty in basis points (500 = 5%), paid by marketplaces that honor ERC-2981.
+    function setRoyalty(address receiver, uint96 bps) external onlyOwner {
+        _setDefaultRoyalty(receiver, bps);
+        royaltyReceiver = receiver;
+        emit RoyaltyUpdated(receiver, bps);
+    }
+
+    /// @notice Change burn and shrine bps together with the payee list, in one call, so the payees always sum to
+    /// exactly `BPS - burnBps - shrineBps`. `referralBps` must still fit in the new payee pool.
+    function setSplit(uint16 burnBps_, uint16 shrineBps_, Payee[] calldata payees_) external onlyOwner {
+        if (uint256(burnBps_) + uint256(shrineBps_) >= BPS) revert InvalidSplit(burnBps_, shrineBps_);
+        uint256 pool = BPS - uint256(burnBps_) - uint256(shrineBps_);
+        if (referralBps > pool) revert InvalidReferralBps(referralBps, pool);
+        burnBps = burnBps_;
+        shrineBps = shrineBps_;
+        emit SplitUpdated(burnBps_, shrineBps_);
+        _setPayees(payees_);
+    }
+
+    /// @notice Replace the payee list. The bps must sum to exactly `payeePoolBps()`.
+    function setPayees(Payee[] calldata payees_) external onlyOwner {
+        _setPayees(payees_);
+    }
+
+    function setReferralBps(uint16 referralBps_) external onlyOwner {
+        uint256 pool = payeePoolBps();
+        if (referralBps_ > pool) revert InvalidReferralBps(referralBps_, pool);
+        referralBps = referralBps_;
+        emit ReferralBpsUpdated(referralBps_);
+    }
+
+    function setAddresses(address shrine_, address burnSink_) external onlyOwner {
+        if (shrine_ == address(0) || burnSink_ == address(0)) revert ZeroAddress();
+        shrine = shrine_;
+        burnSink = burnSink_;
+        emit AddressesUpdated(shrine_, burnSink_);
+    }
+
+    function setBaseURI(string calldata baseURI_) external onlyOwner {
+        _baseTokenURI = baseURI_;
+        emit BaseURIUpdated(baseURI_);
+        emit BatchMetadataUpdate(1, type(uint256).max);
+    }
+
+    function setSteward(address steward_) external onlyOwner {
+        if (steward_ == address(0)) revert ZeroAddress();
+        emit StewardUpdated(steward, steward_);
+        steward = steward_;
+    }
+
+    function setPhase(Phase phase_) external onlyOwner {
+        phase = phase_;
+        emit PhaseUpdated(phase_);
+    }
+
+    /// @notice Allowlist tree root (OpenZeppelin StandardMerkleTree, leaf types ["address", "uint256"]).
+    /// Slots already used (`allowlistMinted`) carry over when the root changes.
+    function setAllowlistRoot(bytes32 root) external onlyOwner {
+        allowlistRoot = root;
+        emit AllowlistRootUpdated(root);
+    }
+
+    /// @param maxPerWallet_ cap on public-price forges per wallet; 0 = unlimited.
+    function setMaxPerWallet(uint256 maxPerWallet_) external onlyOwner {
+        maxPerWallet = maxPerWallet_;
+        emit MaxPerWalletUpdated(maxPerWallet_);
+    }
+
+    // ------------------------------------------------------------------ views
+
+    function payees() external view returns (Payee[] memory) {
+        return _payees;
+    }
+
+    function payeeCount() external view returns (uint256) {
+        return _payees.length;
+    }
+
+    /// @notice Bps of the price that goes to the payees (before any referral): `BPS - burnBps - shrineBps`.
+    function payeePoolBps() public view returns (uint256) {
+        return uint256(BPS) - burnBps - shrineBps;
+    }
+
+    /// @notice How a forge at `price` is split. Rounding dust of burn/shrine stays in the payees' share.
+    function previewSplit(uint256 price, bool referred)
+        public
+        view
+        returns (uint256 burned, uint256 toShrine, uint256 toPayees, uint256 toReferrer)
+    {
+        burned = (price * burnBps) / BPS;
+        toShrine = (price * shrineBps) / BPS;
+        toPayees = price - burned - toShrine;
+        if (referred) {
+            toReferrer = (price * referralBps) / BPS; // <= toPayees because referralBps <= payeePoolBps()
+            toPayees -= toReferrer;
+        }
+    }
+
+    /// @notice A referrer is paid when it is non-zero, is not the minter and owns at least one soul.
+    function isValidReferrer(address referrer, address minter) public view returns (bool) {
+        return referrer != address(0) && referrer != minter && balanceOf(referrer) != 0;
+    }
+
+    /// @notice Allowlist leaf, OpenZeppelin StandardMerkleTree encoding for ["address", "uint256"].
+    function allowlistLeaf(address account, uint256 maxMints) public pure returns (bytes32) {
+        return keccak256(bytes.concat(keccak256(abi.encode(account, maxMints))));
+    }
+
+    function baseURI() external view returns (string memory) {
+        return _baseTokenURI;
+    }
+
+    /// @dev `tokenURI(id)` (inherited) = baseURI + decimal id; reverts for nonexistent tokens.
+    function _baseURI() internal view override returns (string memory) {
+        return _baseTokenURI;
+    }
+
+    function supportsInterface(bytes4 interfaceId) public view override(ERC721, ERC2981, IERC165) returns (bool) {
+        return interfaceId == ERC4906_INTERFACE_ID || super.supportsInterface(interfaceId);
+    }
+
+    // --------------------------------------------------------------- internal
+
+    function _forge(bytes32 soulHash, address referrer, uint256 price) private returns (uint256 tokenId) {
+        tokenId = _registerSoul(soulHash);
+        // Invalid referrers are ignored, not rejected.
+        if (!isValidReferrer(referrer, msg.sender)) referrer = address(0);
+
+        Split memory s;
+        (s.burned, s.toShrine, s.toPayees, s.toReferrer) = previewSplit(price, referrer != address(0));
+        if (referrer != address(0)) {
+            referralCount[referrer] += 1;
+            referralEarned[referrer] += s.toReferrer;
+        }
+
+        _collect(burnSink, s.burned);
+        _collect(shrine, s.toShrine);
+        _collect(referrer, s.toReferrer);
+        _payPayees(s.toPayees);
+
+        _safeMint(msg.sender, tokenId);
+        emit SoulForged(tokenId, msg.sender, soulHash, price, s.burned, s.toShrine, s.toPayees, referrer, s.toReferrer);
+        if (s.toReferrer != 0) emit Referred(referrer, tokenId, s.toReferrer);
+    }
+
+    /// @dev Checks the soul hash and the supply cap, then assigns the next token id.
+    function _registerSoul(bytes32 soulHash) private returns (uint256 tokenId) {
+        if (soulHash == bytes32(0)) revert ZeroSoulHash();
+        uint256 existing = tokenOfSoul[soulHash];
+        if (existing != 0) revert SoulAlreadyForged(soulHash, existing);
+        uint256 cap = maxSupply;
+        if (totalForged >= cap) revert MaxSupplyReached(cap);
+        tokenId = ++totalForged;
+        soulHashOf[tokenId] = soulHash;
+        tokenOfSoul[soulHash] = tokenId;
+        revealBlock[tokenId] = block.number + 1;
+    }
+
+    /// @dev Draws a Mark from what is left of the deck. Each slot left weighs 1, times `boost` above Mortal.
+    /// The deck always has at least as many slots left as souls waiting for a reveal, so `total` is never 0.
+    function _draw(uint256 rand, uint256 boost) private view returns (Mark) {
+        uint256[4] memory w;
+        uint256 total;
+        for (uint256 i; i < 4; ++i) {
+            uint256 left = markCap[i] - markRevealed[i];
+            w[i] = i == 0 ? left : left * boost;
+            total += w[i];
+        }
+        uint256 r = rand % total;
+        for (uint256 i = 4; i > 0;) {
+            unchecked {
+                --i;
+            }
+            if (r < w[i]) return Mark(i + 1);
+            r -= w[i];
+        }
+        return Mark.Mortal;
+    }
+
+    function _collect(address to, uint256 amount) private {
+        if (amount != 0) imd.safeTransferFrom(msg.sender, to, amount);
+    }
+
+    function _collectService(uint256 paid) private {
+        uint256 toShrine = paid < oracleCost ? paid : oracleCost;
+        _collect(shrine, toShrine);
+        _payPayees(paid - toShrine);
+    }
+
+    /// @dev Splits `amount` across the payees pro rata by bps; the last payee receives the rounding dust.
+    function _payPayees(uint256 amount) private {
+        if (amount == 0) return;
+        uint256 pool = payeePoolBps();
+        uint256 last = _payees.length - 1;
+        uint256 left = amount;
+        for (uint256 i; i < last; ++i) {
+            Payee memory p = _payees[i];
+            uint256 share = (amount * p.bps) / pool;
+            left -= share;
+            _collect(p.account, share);
+        }
+        _collect(_payees[last].account, left);
+    }
+
+    function _setPayees(Payee[] memory payees_) private {
+        uint256 n = payees_.length;
+        if (n == 0 || n > MAX_PAYEES) revert InvalidPayeeCount(n);
+        delete _payees;
+        uint256 sum;
+        for (uint256 i; i < n; ++i) {
+            Payee memory p = payees_[i];
+            if (p.account == address(0)) revert ZeroAddress();
+            if (p.bps == 0) revert ZeroPayeeBps(i);
+            for (uint256 k; k < i; ++k) {
+                if (payees_[k].account == p.account) revert DuplicatePayee(p.account);
+            }
+            sum += p.bps;
+            _payees.push(p);
+        }
+        uint256 pool = payeePoolBps();
+        if (sum != pool) revert PayeeBpsMismatch(sum, pool);
+        emit PayeesUpdated(payees_);
+    }
+}
