@@ -23,6 +23,7 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 /// of the price goes to the referrer, taken out of the payees' share.
 ///
 /// Petitions and commissions pay the IMD network's cost (`oracleCost`) to the shrine and the rest to the payees.
+/// The Bazaar (`purchase`) sells looks only, never stats; each purchase is split like a forge without a referrer.
 /// Secondary sales carry an ERC-2981 royalty to `royaltyReceiver`.
 /// Death in the game never burns the NFT: the steward marks it as a memorial instead.
 ///
@@ -144,6 +145,16 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
     event Petitioned(uint256 indexed tokenId, address indexed by, bytes32 indexed petitionHash, uint256 paid);
     event Commissioned(uint256 indexed tokenId, address indexed by, uint8 kind, bytes32 indexed briefHash, uint256 paid);
     event Memorialized(uint256 indexed tokenId, bytes32 chronicleHash);
+    /// @notice A cosmetic bought in the Bazaar for a soul. `itemId` names the item in the game's catalogue.
+    event Purchased(
+        uint256 indexed tokenId,
+        address indexed buyer,
+        bytes32 indexed itemId,
+        uint256 amount,
+        uint256 burned,
+        uint256 toShrine,
+        uint256 toPayees
+    );
 
     event PricesUpdated(uint256 mintPrice, uint256 allowlistPrice, uint256 petitionPrice, uint256 commissionPrice);
     event SplitUpdated(uint16 burnBps, uint16 shrineBps);
@@ -181,6 +192,7 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
     error DuplicatePayee(address account);
     error PayeeBpsMismatch(uint256 sum, uint256 expected);
     error InvalidReferralBps(uint256 referralBps, uint256 payeePoolBps);
+    error ZeroAmount();
 
     // ------------------------------------------------------------- modifiers
 
@@ -281,6 +293,22 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
         uint256 paid = commissionPrice;
         _collectService(paid);
         emit Commissioned(tokenId, msg.sender, kind, briefHash, paid);
+    }
+
+    /// @notice Buy a cosmetic in the Bazaar for a living soul you own: looks only, never stats, odds or rewards.
+    /// Pulls `amount` IMD and splits it exactly like a forge with no referrer: `burnBps` burned, `shrineBps` to the
+    /// shrine (oracle questions and the weekly rewards), the rest to the payees by their bps. The game server reads
+    /// the `Purchased` event and grants `itemId` to the soul if `amount` covers its catalogue price; the item then
+    /// belongs to the soul and follows the token to every new owner. Memorial souls cannot buy (like petitions):
+    /// they rest as graves in the world, and what they bought while alive stays on their card.
+    function purchase(uint256 tokenId, bytes32 itemId, uint256 amount) external nonReentrant onlyTokenOwner(tokenId) {
+        if (memorial[tokenId]) revert SoulIsMemorial(tokenId);
+        if (amount == 0) revert ZeroAmount();
+        (uint256 burned, uint256 toShrine, uint256 toPayees,) = previewSplit(amount, false);
+        _collect(burnSink, burned);
+        _collect(shrine, toShrine);
+        _payPayees(toPayees);
+        emit Purchased(tokenId, msg.sender, itemId, amount, burned, toShrine, toPayees);
     }
 
     // ------------------------------------------------------------------ marks
