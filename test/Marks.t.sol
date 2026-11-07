@@ -30,6 +30,8 @@ contract MarksTest is Test {
         nft = new GodsOfIMDInhabitants(owner, IERC20(address(imd)), shrine, burn);
         vm.prank(owner);
         nft.setPhase(GodsOfIMDInhabitants.Phase.Public);
+        vm.prank(owner);
+        nft.setMaxPerWallet(0); // these tests draw the whole deck from one wallet; the caps have their own tests
         imd.mint(player, 1_000_000 ether);
         vm.prank(player);
         imd.approve(address(nft), type(uint256).max);

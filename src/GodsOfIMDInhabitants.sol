@@ -18,7 +18,7 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 /// Every forge is split by basis points of the price paid:
 ///  - `burnBps` is burned (sent to `burnSink`),
 ///  - `shrineBps` funds the {OracleShrine}, the game treasury that buys oracle questions and pays weekly rewards,
-///  - the rest (`payeePoolBps()`) goes to the team and founders, split across the public `payees()` list by their bps.
+///  - the rest (`payeePoolBps()`) is split across the public `payees()` list by their bps.
 /// If the forge names a valid referrer (an address that already owns a soul, other than the minter), `referralBps`
 /// of the price goes to the referrer, taken out of the payees' share.
 ///
@@ -34,7 +34,7 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
 
     // ------------------------------------------------------------------ types
 
-    /// @notice A recipient of the team-and-founders share. `bps` is of the full price paid.
+    /// @notice A recipient of the payee share. `bps` is of the full price paid.
     struct Payee {
         address account;
         uint16 bps;
@@ -94,7 +94,8 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
     Phase public phase;
     /// @notice `GENESIS_SUPPLY`, the sum of `markCap`.
     uint256 public maxSupply;
-    /// @notice Cap on public-price forges per wallet (`mintedBy`). 0 = unlimited. Allowlist forges don't count.
+    /// @notice Most souls one wallet may forge (`mintedBy`, every forge counts): 20 at deploy. 0 = unlimited.
+    /// A Seer's allowlist leaf can raise it for that wallet (25 for IMD agent-seat holders).
     uint256 public maxPerWallet;
     uint256 public totalForged;
     /// @notice Root of an OpenZeppelin StandardMerkleTree of `(address account, uint256 maxMints)`.
@@ -115,9 +116,9 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
     mapping(uint256 => bool) public memorial;
     /// @notice Hash of the chronicle recorded when the soul fell (0 while alive).
     mapping(uint256 => bytes32) public chronicleOf;
-    /// @notice Public-price forges per wallet.
+    /// @notice Souls forged by each wallet, public and allowlist together.
     mapping(address => uint256) public mintedBy;
-    /// @notice Allowlist forges per wallet (capped by the `maxMints` in the allowlist leaf).
+    /// @notice Allowlist forges per wallet (at `allowlistPrice`, capped by the `maxMints` in the allowlist leaf).
     mapping(address => uint256) public allowlistMinted;
     /// @notice Souls forged with this address as a valid referrer.
     mapping(address => uint256) public referralCount;
@@ -199,8 +200,8 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
     uint256 public constant GENESIS_SUPPLY = 1000;
 
     /// @dev Only addresses, so IMD's launch can deploy it as is (`$owner`, `$contract:OracleShrine`). The Genesis
-    /// rules are built in: 1000 souls, the deck 640 / 250 / 100 / 10, 5 IMD public and 4 IMD allowlist. Until the
-    /// owner calls `setPayees`, the whole team share and the 5% royalty go to the owner; `setBaseURI` points the
+    /// rules are built in: 1000 souls, the deck 640 / 250 / 100 / 10, 5 IMD public and 4 IMD allowlist, 20 souls per
+    /// wallet (Seers 25). Until the owner calls `setPayees`, the payee share and the 5% royalty go to the owner; `setBaseURI` points the
     /// metadata at the game. Starts in `Phase.Closed`; the owner opens it with `setPhase`.
     constructor(address owner_, IERC20 imd_, address shrine_, address burnSink_)
         ERC721("GODS OF IMD Inhabitants", "SOUL")
@@ -215,9 +216,10 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
         markCap = [uint16(640), 250, 100, 10];
         mintPrice = 5 ether;
         allowlistPrice = 4 ether;
-        Payee[] memory team = new Payee[](1);
-        team[0] = Payee(owner_, uint16(payeePoolBps()));
-        _setPayees(team);
+        maxPerWallet = 20;
+        Payee[] memory initial = new Payee[](1);
+        initial[0] = Payee(owner_, uint16(payeePoolBps()));
+        _setPayees(initial);
         royaltyReceiver = owner_;
         _setDefaultRoyalty(owner_, 500); // 5% on secondary sales
     }
@@ -254,6 +256,12 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
         }
         uint256 used = allowlistMinted[msg.sender];
         if (used >= maxMints) revert AllowlistCapReached(msg.sender, maxMints);
+        // the wallet cap counts every forge; a Seer's leaf may lift it (20 for everyone, 25 for Seers)
+        uint256 limit = maxPerWallet;
+        if (limit != 0 && maxMints > limit) limit = maxMints;
+        uint256 minted = mintedBy[msg.sender];
+        if (limit != 0 && minted >= limit) revert WalletLimitReached(msg.sender, limit);
+        mintedBy[msg.sender] = minted + 1;
         allowlistMinted[msg.sender] = used + 1;
         tokenId = _forge(soulHash, referrer, allowlistPrice);
     }
@@ -413,7 +421,7 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
         emit AllowlistRootUpdated(root);
     }
 
-    /// @param maxPerWallet_ cap on public-price forges per wallet; 0 = unlimited.
+    /// @param maxPerWallet_ most souls one wallet may forge (every forge counts); 0 = unlimited.
     function setMaxPerWallet(uint256 maxPerWallet_) external onlyOwner {
         maxPerWallet = maxPerWallet_;
         emit MaxPerWalletUpdated(maxPerWallet_);
