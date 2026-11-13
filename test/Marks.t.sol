@@ -84,53 +84,70 @@ contract MarksTest is Test {
         assertEq(uint8(nft.markOf(b)), uint8(GodsOfIMDInhabitants.Mark.Unrevealed));
     }
 
+    /// 900 paid souls (ids 1-900) and the 100 reserved ones (ids 901-1000) empty the deck exactly.
     function test_fullDeckComesOutExactly() public {
         uint256 total;
-        for (uint256 i = 1; i <= 1000; ++i) {
+        for (uint256 i = 1; i <= 900; ++i) {
             vm.prevrandao(bytes32(i * 7919));
             uint256 id = _forge(i);
+            assertEq(id, i);
+            vm.roll(block.number + 2);
+            nft.reveal(id);
+            total++;
+        }
+        vm.expectRevert(abi.encodeWithSelector(GodsOfIMDInhabitants.MaxSupplyReached.selector, 900));
+        _forge(901);
+        for (uint256 i = 1; i <= 100; ++i) {
+            vm.prank(owner);
+            uint256 id = nft.forgeReserved(keccak256(abi.encode("reserved", i)));
+            assertEq(id, 900 + i);
             vm.roll(block.number + 2);
             nft.reveal(id);
             total++;
         }
         assertEq(total, 1000);
+        assertEq(nft.totalForged(), 1000);
         for (uint256 m; m < 4; ++m) assertEq(nft.markRevealed(m), caps[m]);
-        vm.expectRevert(abi.encodeWithSelector(GodsOfIMDInhabitants.MaxSupplyReached.selector, 1000));
-        _forge(1001);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(GodsOfIMDInhabitants.ReserveExhausted.selector, 100));
+        nft.forgeReserved(keccak256("one more"));
     }
 
-    function test_earlyBoostWaves() public view {
-        assertEq(nft.earlyBoost(1), 5);
-        assertEq(nft.earlyBoost(10), 5);
-        assertEq(nft.earlyBoost(11), 3);
-        assertEq(nft.earlyBoost(50), 3);
-        assertEq(nft.earlyBoost(51), 2);
-        assertEq(nft.earlyBoost(150), 2);
-        assertEq(nft.earlyBoost(151), 1);
-        assertEq(nft.earlyBoost(1000), 1);
-    }
-
-    /// Early souls draw rare Marks far more often than late ones (many independent decks).
-    function test_earlySoulsAreLuckier() public {
-        uint256 earlyRare;
-        uint256 lateRare;
-        for (uint256 run; run < 6; ++run) {
-            setUp();
-            for (uint256 i = 1; i <= 200; ++i) {
-                vm.roll(block.number + 1);
-                uint256 id = _forge(run * 1000 + i);
-                vm.roll(block.number + 2);
-                nft.reveal(id);
-                bool rare = nft.markOf(id) != GodsOfIMDInhabitants.Mark.Mortal;
-                if (rare && i <= 10) earlyRare++;
-                if (rare && i > 150) lateRare++;
-            }
+    /// The draw the contract makes, recomputed here: every slot left in the deck is as likely as any other, for the
+    /// first soul as for the last (no early waves).
+    function _expected(uint256 id) internal view returns (uint8) {
+        uint256 b = nft.revealBlock(id);
+        bytes32 h = blockhash(b);
+        if (h == bytes32(0)) h = blockhash(block.number - 1);
+        uint256 rand = uint256(keccak256(abi.encode(h, nft.soulHashOf(id), id)));
+        uint256[4] memory w;
+        uint256 sum;
+        for (uint256 k; k < 4; ++k) {
+            w[k] = caps[k] - nft.markRevealed(k);
+            sum += w[k];
         }
-        // 10 early souls vs 50 late souls per run: compare rates
-        uint256 earlyRate = (earlyRare * 1e6) / (6 * 10);
-        uint256 lateRate = (lateRare * 1e6) / (6 * 50);
-        emit log_named_uint("early rare rate (ppm)", earlyRate);
-        emit log_named_uint("late rare rate (ppm)", lateRate);
-        assertGt(earlyRate, lateRate * 15 / 10);
+        uint256 r = rand % sum;
+        for (uint256 k = 4; k > 0; ) {
+            --k;
+            if (r < w[k]) return uint8(k + 1);
+            r -= w[k];
+        }
+        return 1;
+    }
+
+    function test_everySoulDrawsWithTheSameOdds() public {
+        for (uint256 i = 1; i <= 60; ++i) {
+            vm.prevrandao(bytes32(i * 104729));
+            uint256 id = _forge(i);
+            vm.roll(block.number + 2);
+            uint8 want = _expected(id);
+            nft.reveal(id);
+            assertEq(uint8(nft.markOf(id)), want, "the plain draw from what is left of the deck");
+        }
+    }
+
+    function test_noEarlyWaves() public {
+        (bool ok, ) = address(nft).staticcall(abi.encodeWithSignature("earlyBoost(uint256)", uint256(1)));
+        assertFalse(ok, "there is no earlyBoost any more");
     }
 }

@@ -29,7 +29,16 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 ///
 /// The Marks: every soul gets one Mark from a fixed deck (`markCap`: Mortal, Blessed, Ascended, Divine; it sums to
 /// `maxSupply`). Nobody chooses it: `reveal` draws it from the hash of the block after the forge, which nobody knew
-/// when the forge was sent, so a Mark cannot be re-rolled. The first souls draw with better odds (`earlyBoost`).
+/// when the forge was sent, so a Mark cannot be re-rolled. Every soul draws with the same odds: what is left of the deck.
+///
+/// Forging with other tokens: a soul can also be paid in a token the owner lists (`forgeWithToken`, `setForgeToken`):
+/// its price, how many souls it may buy, the share burned, and one payee for the rest after a valid referrer's
+/// `referralBps` (the IMD payees share IMD only). $SHIFT, NIGHTSHIFT's token, is listed at deploy: 200,000 a soul, 30%
+/// burned. It takes the next paid id, under the same wallet cap, like a forge in IMD. New ways to pay need no new NFT.
+///
+/// The creator's reserve: `RESERVE` of the `maxSupply` souls are forged free by the owner (`forgeReserved`), as the
+/// last token ids (901-1000). Every other forge takes the next id from 1 to 900. Reserved souls draw their Mark from the
+/// same deck, with the same odds.
 contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -69,6 +78,10 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
 
     uint16 public constant BPS = 10_000;
     uint256 public constant MAX_PAYEES = 10;
+    /// @notice $SHIFT, NIGHTSHIFT's token on Ethereum: listed as a forge token at deploy.
+    address public constant SHIFT = 0xE5e58E53d0Bb204Aa62c995A6c8CC8a48e60C3AC;
+    /// @notice Where the burned share of a forge token goes: nobody holds its key.
+    address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
     bytes4 private constant ERC4906_INTERFACE_ID = bytes4(0x49064906);
 
     // ------------------------------------------------------------------ state
@@ -98,7 +111,25 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
     /// @notice Most souls one wallet may forge (`mintedBy`, every forge counts): 20 at deploy. 0 = unlimited.
     /// A Seer's allowlist leaf can raise it for that wallet (25 for IMD agent-seat holders).
     uint256 public maxPerWallet;
+    /// @notice Souls forged so far, paid and reserved together.
     uint256 public totalForged;
+    /// @notice Souls kept for the creator inside `maxSupply`: the last `RESERVE` token ids, forged free by the owner.
+    uint256 public constant RESERVE = 100;
+    /// @notice Reserved souls forged so far (at most `RESERVE`).
+    uint256 public reservedForged;
+    /// @notice A token a soul can be paid in besides IMD. `price` 0 turns it off; `cap` is the most souls it may buy;
+    /// `burnBps` of the price is burned (sent to `DEAD`); `payee` gets the rest after a valid referrer's share.
+    struct ForgeToken {
+        uint256 price;
+        uint256 cap;
+        uint256 forged;
+        uint16 burnBps;
+        address payee;
+    }
+
+    /// @notice The forge tokens by address, and every token ever listed (`forgeTokenList`).
+    mapping(address => ForgeToken) public forgeTokens;
+    address[] private _forgeTokenList;
     /// @notice Root of an OpenZeppelin StandardMerkleTree of `(address account, uint256 maxMints)`.
     bytes32 public allowlistRoot;
 
@@ -168,6 +199,18 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
     event MarkRevealed(uint256 indexed tokenId, Mark mark);
     event MaxPerWalletUpdated(uint256 maxPerWallet);
     event OracleCostUpdated(uint256 oracleCost);
+    /// @notice A soul paid in a forge token (its `SoulForged` shows a price of 0 IMD): what was paid, burned and shared.
+    event ForgedWithToken(
+        uint256 indexed tokenId,
+        address indexed owner,
+        address indexed token,
+        uint256 amount,
+        uint256 burned,
+        uint256 toPayee,
+        address referrer,
+        uint256 toReferrer
+    );
+    event ForgeTokenUpdated(address indexed token, uint256 price, uint256 cap, uint16 burnBps, address payee);
     event RoyaltyUpdated(address receiver, uint96 bps);
 
     // ----------------------------------------------------------------- errors
@@ -193,6 +236,9 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
     error PayeeBpsMismatch(uint256 sum, uint256 expected);
     error InvalidReferralBps(uint256 referralBps, uint256 payeePoolBps);
     error ZeroAmount();
+    error ReserveExhausted(uint256 reserve);
+    error TokenForgeOff(address token);
+    error TokenCapReached(address token, uint256 cap);
 
     // ------------------------------------------------------------- modifiers
 
@@ -229,6 +275,7 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
         mintPrice = 5 ether;
         allowlistPrice = 4 ether;
         maxPerWallet = 20;
+        _setForgeToken(SHIFT, 200_000 ether, GENESIS_SUPPLY - RESERVE, 3000, owner_);
         Payee[] memory initial = new Payee[](1);
         initial[0] = Payee(owner_, uint16(payeePoolBps()));
         _setPayees(initial);
@@ -278,6 +325,66 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
         tokenId = _forge(soulHash, referrer, allowlistPrice);
     }
 
+    /// @notice Forge a soul with a forge token at its price (Public phase only, at most its `cap` souls). Pulls the
+    /// token from the caller (approve this contract on it first): `burnBps` burned, a valid referrer's `referralBps`,
+    /// the token's payee the rest. The next paid id, the same odds, the same wallet cap as a forge in IMD.
+    function forgeWithToken(address token, bytes32 soulHash, address referrer) external nonReentrant returns (uint256 tokenId) {
+        ForgeToken storage t = forgeTokens[token];
+        if (t.price == 0) revert TokenForgeOff(token);
+        Phase p = phase;
+        if (p != Phase.Public) {
+            if (p == Phase.Closed) revert ForgeClosed();
+            revert AllowlistOnly();
+        }
+        if (t.forged >= t.cap) revert TokenCapReached(token, t.cap);
+        t.forged += 1;
+        _countWalletForge();
+        tokenId = _nextPaidId();
+        _registerSoul(soulHash, tokenId);
+        if (!isValidReferrer(referrer, msg.sender)) referrer = address(0);
+        _payToken(token, tokenId, referrer);
+        _safeMint(msg.sender, tokenId);
+        emit SoulForged(tokenId, msg.sender, soulHash, 0, 0, 0, 0, referrer, 0);
+    }
+
+    /// @dev One more soul for the caller under `maxPerWallet` (forges in IMD and in forge tokens count alike).
+    function _countWalletForge() private {
+        uint256 limit = maxPerWallet;
+        uint256 minted = mintedBy[msg.sender];
+        if (limit != 0 && minted >= limit) revert WalletLimitReached(msg.sender, limit);
+        mintedBy[msg.sender] = minted + 1;
+    }
+
+    /// @dev Pulls the forge token's price from the caller: the burned share, the referrer's share, the payee the rest.
+    function _payToken(address token, uint256 tokenId, address referrer) private {
+        ForgeToken storage t = forgeTokens[token];
+        uint256 price = t.price;
+        uint256 burned = (price * t.burnBps) / BPS;
+        uint256 toReferrer = referrer != address(0) ? (price * referralBps) / BPS : 0;
+        uint256 toPayee = price - burned - toReferrer;
+        if (referrer != address(0)) referralCount[referrer] += 1;
+        IERC20 erc = IERC20(token);
+        if (burned != 0) erc.safeTransferFrom(msg.sender, DEAD, burned);
+        if (toReferrer != 0) erc.safeTransferFrom(msg.sender, referrer, toReferrer);
+        if (toPayee != 0) erc.safeTransferFrom(msg.sender, t.payee, toPayee);
+        emit ForgedWithToken(tokenId, msg.sender, token, price, burned, toPayee, referrer, toReferrer);
+    }
+
+    /// @notice The owner forges one of the `RESERVE` souls kept for the creator: free, in any phase, outside every
+    /// wallet cap. It takes the next id from `maxSupply - RESERVE + 1` (901) up, and its Mark is drawn from the same
+    /// deck with the same odds as any other soul's. `SoulForged` shows it with a price of 0.
+    function forgeReserved(bytes32 soulHash) external onlyOwner nonReentrant returns (uint256 tokenId) {
+        tokenId = _forgeReserved(soulHash);
+    }
+
+    /// @notice `forgeReserved` for several souls in one transaction, in order.
+    function forgeReservedMany(bytes32[] calldata soulHashes) external onlyOwner nonReentrant returns (uint256 firstId) {
+        uint256 n = soulHashes.length;
+        if (n == 0) revert ZeroAmount();
+        firstId = _forgeReserved(soulHashes[0]);
+        for (uint256 i = 1; i < n; ++i) _forgeReserved(soulHashes[i]);
+    }
+
     /// @notice Petition the God on behalf of a living soul you own. Pays `petitionPrice` IMD:
     /// `oracleCost` to the shrine (one oracle question), the rest to the payees.
     function petition(uint256 tokenId, bytes32 petitionHash) external nonReentrant onlyTokenOwner(tokenId) {
@@ -314,15 +421,15 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
     // ------------------------------------------------------------------ marks
 
     /// @notice Reveal a forged soul's Mark. Anyone may call it from the second block after the forge (the game
-    /// server does it at once). The Mark is drawn from the deck that is left, weighted by `earlyBoost`, using the
-    /// hash of the block after the forge. If that hash is older than 256 blocks, the latest block hash is used.
+    /// server does it at once). The Mark is drawn from the deck that is left, every slot as likely as any other, using
+    /// the hash of the block after the forge. If that hash is older than 256 blocks, the latest block hash is used.
     function reveal(uint256 tokenId) public {
         uint256 b = revealBlock[tokenId];
         if (b == 0 || block.number <= b) revert NotRevealable(tokenId);
         bytes32 h = blockhash(b);
         if (h == bytes32(0)) h = blockhash(block.number - 1);
         delete revealBlock[tokenId];
-        Mark m = _draw(uint256(keccak256(abi.encode(h, soulHashOf[tokenId], tokenId))), earlyBoost(tokenId));
+        Mark m = _draw(uint256(keccak256(abi.encode(h, soulHashOf[tokenId], tokenId))));
         markOf[tokenId] = m;
         unchecked {
             ++markRevealed[uint8(m) - 1];
@@ -337,15 +444,6 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
             uint256 b = revealBlock[tokenIds[i]];
             if (b != 0 && block.number > b) reveal(tokenIds[i]);
         }
-    }
-
-    /// @notice How much the odds of a rare Mark (Blessed and above) are multiplied, by forge order:
-    /// souls 1-10 x5, 11-50 x3, 51-150 x2, then x1. The deck stays fixed, so early luck only empties it sooner.
-    function earlyBoost(uint256 tokenId) public pure returns (uint256) {
-        if (tokenId <= 10) return 5;
-        if (tokenId <= 50) return 3;
-        if (tokenId <= 150) return 2;
-        return 1;
     }
 
     // --------------------------------------------------------------- steward
@@ -449,6 +547,17 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
         emit AllowlistRootUpdated(root);
     }
 
+    /// @notice List a token souls can be paid in, or change one: its price (0 turns it off), the most souls it may
+    /// buy, the share burned (in bps, leaving room for a referrer) and who receives the rest. IMD itself is not one.
+    function setForgeToken(address token, uint256 price, uint256 cap, uint16 burnBps_, address payee) external onlyOwner {
+        _setForgeToken(token, price, cap, burnBps_, payee);
+    }
+
+    /// @notice Every token ever listed with `setForgeToken` (some may be off: price 0).
+    function forgeTokenList() external view returns (address[] memory) {
+        return _forgeTokenList;
+    }
+
     /// @param maxPerWallet_ most souls one wallet may forge (every forge counts); 0 = unlimited.
     function setMaxPerWallet(uint256 maxPerWallet_) external onlyOwner {
         maxPerWallet = maxPerWallet_;
@@ -510,8 +619,29 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
 
     // --------------------------------------------------------------- internal
 
+    function _setForgeToken(address token, uint256 price, uint256 cap, uint16 burnBps_, address payee) private {
+        if (token == address(0) || token == address(imd) || payee == address(0)) revert ZeroAddress();
+        if (uint256(burnBps_) + referralBps > BPS) revert InvalidSplit(burnBps_, referralBps);
+        ForgeToken storage t = forgeTokens[token];
+        if (t.payee == address(0)) _forgeTokenList.push(token);
+        t.price = price;
+        t.cap = cap;
+        t.burnBps = burnBps_;
+        t.payee = payee;
+        emit ForgeTokenUpdated(token, price, cap, burnBps_, payee);
+    }
+
+    /// @dev Paid souls (IMD or a forge token) take ids 1 .. maxSupply - RESERVE in order; the reserve has the ids after.
+    function _nextPaidId() private view returns (uint256) {
+        uint256 cap = maxSupply - RESERVE;
+        uint256 paid = totalForged - reservedForged;
+        if (paid >= cap) revert MaxSupplyReached(cap);
+        return paid + 1;
+    }
+
     function _forge(bytes32 soulHash, address referrer, uint256 price) private returns (uint256 tokenId) {
-        tokenId = _registerSoul(soulHash);
+        tokenId = _nextPaidId();
+        _registerSoul(soulHash, tokenId);
         // Invalid referrers are ignored, not rejected.
         if (!isValidReferrer(referrer, msg.sender)) referrer = address(0);
 
@@ -532,27 +662,35 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
         if (s.toReferrer != 0) emit Referred(referrer, tokenId, s.toReferrer);
     }
 
-    /// @dev Checks the soul hash and the supply cap, then assigns the next token id.
-    function _registerSoul(bytes32 soulHash) private returns (uint256 tokenId) {
+    /// @dev The next reserved id (from `maxSupply - RESERVE + 1`), minted free to the owner.
+    function _forgeReserved(bytes32 soulHash) private returns (uint256 tokenId) {
+        uint256 n = reservedForged;
+        if (n >= RESERVE) revert ReserveExhausted(RESERVE);
+        reservedForged = n + 1;
+        tokenId = maxSupply - RESERVE + n + 1;
+        _registerSoul(soulHash, tokenId);
+        _safeMint(msg.sender, tokenId);
+        emit SoulForged(tokenId, msg.sender, soulHash, 0, 0, 0, 0, address(0), 0);
+    }
+
+    /// @dev Checks the soul hash, counts the soul and books `tokenId` for it (the callers check their own cap).
+    function _registerSoul(bytes32 soulHash, uint256 tokenId) private {
         if (soulHash == bytes32(0)) revert ZeroSoulHash();
         uint256 existing = tokenOfSoul[soulHash];
         if (existing != 0) revert SoulAlreadyForged(soulHash, existing);
-        uint256 cap = maxSupply;
-        if (totalForged >= cap) revert MaxSupplyReached(cap);
-        tokenId = ++totalForged;
+        ++totalForged;
         soulHashOf[tokenId] = soulHash;
         tokenOfSoul[soulHash] = tokenId;
         revealBlock[tokenId] = block.number + 1;
     }
 
-    /// @dev Draws a Mark from what is left of the deck. Each slot left weighs 1, times `boost` above Mortal.
-    /// The deck always has at least as many slots left as souls waiting for a reveal, so `total` is never 0.
-    function _draw(uint256 rand, uint256 boost) private view returns (Mark) {
+    /// @dev Draws a Mark from what is left of the deck: every slot left is as likely as any other. The deck always has
+    /// at least as many slots left as souls waiting for a reveal, so `total` is never 0.
+    function _draw(uint256 rand) private view returns (Mark) {
         uint256[4] memory w;
         uint256 total;
         for (uint256 i; i < 4; ++i) {
-            uint256 left = markCap[i] - markRevealed[i];
-            w[i] = i == 0 ? left : left * boost;
+            w[i] = markCap[i] - markRevealed[i];
             total += w[i];
         }
         uint256 r = rand % total;
@@ -576,8 +714,9 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
         _payPayees(paid - toShrine);
     }
 
-    /// @dev Splits `amount` across the payees pro rata by bps; the last payee receives the rounding dust.
+    /// @dev Splits `amount` IMD across the payees pro rata by bps; the last payee receives the rounding dust.
     function _payPayees(uint256 amount) private {
+        IERC20 token = imd;
         if (amount == 0) return;
         uint256 pool = payeePoolBps();
         uint256 last = _payees.length - 1;
@@ -586,9 +725,9 @@ contract GodsOfIMDInhabitants is IERC4906, ERC721, ERC2981, Ownable, ReentrancyG
             Payee memory p = _payees[i];
             uint256 share = (amount * p.bps) / pool;
             left -= share;
-            _collect(p.account, share);
+            if (share != 0) token.safeTransferFrom(msg.sender, p.account, share);
         }
-        _collect(_payees[last].account, left);
+        if (left != 0) token.safeTransferFrom(msg.sender, _payees[last].account, left);
     }
 
     function _setPayees(Payee[] memory payees_) private {
